@@ -1,8 +1,14 @@
 package spring2020.mcon364.emailScraper;
 
-public class Main {
+import java.io.IOException;
+import java.sql.SQLException;
 
+public class Main {
     public static void main(String[] args) {
-        new Scraper();
+        try {
+            new Scraper();
+        } catch (IOException | SQLException e) {
+            e.printStackTrace();
+        }
     }
 }
