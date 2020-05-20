@@ -103,10 +103,11 @@ public class Scraper {
                 //Emails:
                 Matcher emailMatcher = Pattern.compile("[A-Za-z][A-Za-z.\\-_%+]{0,63}@" +
                         "(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?\\.){1,8}" +
-                        "[A-Za-z]{2,63}").matcher(doc.toString()); //TODO: exclude files which contain @ in their name
+                        "[A-Za-z]{2,63}").matcher(doc.toString());
                 while (emailMatcher.find()) {
-                    if (EMAILS.size() < MAX_EMAILS) {
-                        EMAILS.add(emailMatcher.group());
+                    String email = filterEmail(emailMatcher.group());
+                    if (EMAILS.size() < MAX_EMAILS && email != null) {
+                        EMAILS.add(email);
                     }
                 }
             } catch (Exception ignored) {}
@@ -121,6 +122,20 @@ public class Scraper {
                 url = url + '/';
             }
             return url;
+        }
+
+        //Removes
+        private String filterEmail(String email) {
+            int i  = email.length();
+            String[] fileTypes = new String[] {"png", "jpg", "gif", "pdf", "mp3", "mp4", "mov", "7z", "zip", "mkv", "avi", "jpeg"};
+            String lc = email.substring(email.indexOf('@')).toLowerCase();
+            for (String t: fileTypes) {
+                if (lc.contains('.' + t)) {
+                    email = null;
+                    break;
+                }
+            }
+            return email;
         }
     }
 }
