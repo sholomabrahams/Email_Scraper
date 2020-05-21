@@ -2,6 +2,6 @@ package spring2020.mcon364.emailScraper;
 
 public class Main {
     public static void main(String[] args) {
-        new Scraper(500, 750);
+        new Scraper(100, 1500);
     }
 }

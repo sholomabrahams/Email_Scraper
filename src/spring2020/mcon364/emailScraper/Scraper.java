@@ -56,12 +56,13 @@ public class Scraper {
     }
 
     private void upload() {
+        long END_TIME = System.currentTimeMillis();
+        System.out.println("Finished harvesting data.\nElapsed time: " + (END_TIME - START_TIME) + "ms.");
         try {
             Connection connection = DriverManager.getConnection(connectionString());
             query("Emails", connection, new ArrayList<>(EMAILS));
             query("URLs", connection, new ArrayList<>(VISITED));
-
-            final long END_TIME = System.currentTimeMillis();
+            END_TIME = System.currentTimeMillis();
             System.out.println("Successfully uploaded results.\nElapsed time: " + (END_TIME - START_TIME) + "ms.");
         } catch (SQLException throwables) {
             System.out.println("Could not complete query:");
