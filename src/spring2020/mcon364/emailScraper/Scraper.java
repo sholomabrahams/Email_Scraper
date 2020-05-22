@@ -24,25 +24,40 @@ public class Scraper {
     private final Set<String> EMAILS, VISITED;
     private final LinkedBlockingQueue<String> URLS;
     private final int MAX_EMAILS;
-    private final long START_TIME;
+    private final Connection CONNECTION;
 
-    public Scraper(int maxEmails, int maxThreads) {
-        START_TIME = System.currentTimeMillis();
+    public Scraper(int maxEmails, int maxThreads, int uploadThreshold) throws IOException, SQLException {
+        long START_TIME = System.currentTimeMillis();
         MAX_EMAILS = maxEmails;
+        CONNECTION = DriverManager.getConnection(connectionString());
         ExecutorService pool = Executors.newFixedThreadPool(maxThreads);
         URLS = new LinkedBlockingQueue<>();
         URLS.add("https://www.touro.edu/");
         VISITED = Collections.synchronizedSet(new HashSet<>((int) (MAX_EMAILS * 1.25)));
         EMAILS = Collections.synchronizedSet(new HashSet<>(MAX_EMAILS));
-        while (EMAILS.size() < MAX_EMAILS) {
-            String url = URLS.poll();
-            if (url != null) {
-                VISITED.add(url);
-                pool.execute(new ScraperWorker(url));
-            }
-        }
+        crawl(pool, uploadThreshold);
         pool.shutdownNow();
-        upload();
+        if (!EMAILS.isEmpty()) {
+            new Thread(new Uploader(new ArrayList<>(EMAILS))).start();
+        }
+        double executionTime = (System.currentTimeMillis() - START_TIME) / 1000.0;
+        log(maxThreads, uploadThreshold, executionTime);
+        System.out.println("Completed crawl and upload.\nElapsed time: "
+                + executionTime + "s.");
+    }
+
+    private void log(int maxThreads, int uploadThreshold, double executionTime) {
+        try {
+            PreparedStatement logQuery = CONNECTION.prepareStatement("INSERT INTO Log VALUES(SYSDATETIME(), ?, ?, ?, ?)");
+            logQuery.setInt(1, MAX_EMAILS);
+            logQuery.setInt(2, maxThreads);
+            logQuery.setInt(3, uploadThreshold);
+            logQuery.setDouble(4, executionTime);
+            logQuery.execute();
+            logQuery.closeOnCompletion();
+        } catch (SQLException throwables) {
+            throwables.printStackTrace();
+        }
     }
 
     private String connectionString() throws IOException {
@@ -55,32 +70,25 @@ public class Scraper {
                 ";password=" + props.getProperty("password");
     }
 
-    private void upload() {
-        long END_TIME = System.currentTimeMillis();
-        System.out.println("Finished harvesting data.\nElapsed time: " + (END_TIME - START_TIME) + "ms.");
-        try {
-            Connection connection = DriverManager.getConnection(connectionString());
-            query("Emails", connection, new ArrayList<>(EMAILS));
-            query("URLs", connection, new ArrayList<>(VISITED));
-            END_TIME = System.currentTimeMillis();
-            System.out.println("Successfully uploaded results.\nElapsed time: " + (END_TIME - START_TIME) + "ms.");
-        } catch (SQLException throwables) {
-            System.out.println("Could not complete query:");
-            throwables.printStackTrace();
-        } catch (IOException e) {
-            System.out.println("Could not retrieve database secrets:");
-            e.printStackTrace();
+    private void crawl(ExecutorService pool, int uploadThreshold) {
+        int uploadCount = 0;
+        String url;
+        while (EMAILS.size() + uploadCount < MAX_EMAILS) {
+            url = URLS.poll();
+            if (url != null) {
+                VISITED.add(url);
+                pool.execute(new ScraperWorker(url));
+            }
+            if (EMAILS.size() > uploadThreshold) {
+                synchronized (EMAILS) {
+                    uploadCount += EMAILS.size();
+                    pool.execute(new Uploader(new ArrayList<>(EMAILS)));
+                    EMAILS.clear();
+                    System.out.println(uploadCount);
+                }
+            }
         }
-    }
-
-    private void query(String table, Connection connection, ArrayList<String> data) throws SQLException {
-        PreparedStatement stmt = connection.prepareStatement("INSERT INTO " + table + " VALUES (?)");
-        for (String e : data) {
-            stmt.setString(1, e);
-            stmt.addBatch();
-        }
-        stmt.executeBatch();
-        stmt.closeOnCompletion();
+        System.out.println("Number of emails: " + (EMAILS.size() + uploadCount * uploadThreshold));
     }
 
     class ScraperWorker implements Runnable {
@@ -96,8 +104,7 @@ public class Scraper {
                 Document doc = Jsoup.connect(URL).get();
                 //URLs:
                 doc.select("a[href]").eachAttr("abs:href").forEach(a -> {
-                    a = trimURL(a);
-                    if (!VISITED.contains(a) && (a.contains("https://") || a.contains("http://"))) {
+                    if (!VISITED.contains(a) && /*Exclude links that are not webpages*/ (a.contains("https://") || a.contains("http://"))) {
                         URLS.add(a);
                     }
                 });
@@ -114,20 +121,8 @@ public class Scraper {
             } catch (Exception ignored) {}
         }
 
-        private String trimURL(String url) {
-            int i = url.indexOf('#');
-            if (i >= 0) {
-                url = url.substring(0, i);
-            }
-            if (!url.contains("?") && url.charAt(url.length() - 1) != '/') {
-                url = url + '/';
-            }
-            return url;
-        }
-
         //Removes
         private String filterEmail(String email) {
-            int i  = email.length();
             String[] fileTypes = new String[] {"png", "jpg", "gif", "pdf", "mp3", "mp4", "mov", "7z", "zip", "mkv", "avi", "jpeg"};
             String lc = email.substring(email.indexOf('@')).toLowerCase();
             for (String t: fileTypes) {
@@ -137,6 +132,30 @@ public class Scraper {
                 }
             }
             return email;
+        }
+    }
+
+    private class Uploader implements Runnable {
+        private final ArrayList<String> DATA;
+
+        public Uploader(ArrayList<String> strings) {
+            DATA = strings;
+        }
+
+        @Override
+        public void run() {
+            try {
+                PreparedStatement stmt = CONNECTION.prepareStatement("INSERT INTO Emails VALUES (?)");
+                for (String e : DATA) {
+                    stmt.setString(1, e);
+                    stmt.addBatch();
+                }
+                stmt.executeBatch();
+                stmt.closeOnCompletion();
+            } catch (SQLException e) {
+                System.out.println("Data upload failed:");
+                e.printStackTrace();
+            }
         }
     }
 }
