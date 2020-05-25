@@ -9,7 +9,6 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Properties;
@@ -23,40 +22,48 @@ import java.util.regex.Pattern;
 public class Scraper {
     private final Set<String> EMAILS, VISITED;
     private final LinkedBlockingQueue<String> URLS;
-    private final int MAX_EMAILS;
-    private final Connection CONNECTION;
+    private final int MAX_EMAILS, MAX_THREADS, MAX_URLS;
+    private Connection dbConnection = null;
 
-    public Scraper(int maxEmails, int maxThreads, int uploadThreshold) throws IOException, SQLException {
+    public Scraper(int maxEmails, int maxThreads) {
         long START_TIME = System.currentTimeMillis();
         MAX_EMAILS = maxEmails;
-        CONNECTION = DriverManager.getConnection(connectionString());
-        ExecutorService pool = Executors.newFixedThreadPool(maxThreads);
+        MAX_THREADS = maxThreads;
+        MAX_URLS = (int) (MAX_THREADS * 1.5);
+        ExecutorService pool = Executors.newFixedThreadPool(MAX_THREADS);
         URLS = new LinkedBlockingQueue<>();
         URLS.add("https://www.touro.edu/");
-        VISITED = Collections.synchronizedSet(new HashSet<>((int) (MAX_EMAILS * 1.25)));
+        VISITED = Collections.synchronizedSet(new HashSet<>(MAX_EMAILS * 5));
         EMAILS = Collections.synchronizedSet(new HashSet<>(MAX_EMAILS));
-        crawl(pool, uploadThreshold);
+        crawl(pool);
         pool.shutdownNow();
-        if (!EMAILS.isEmpty()) {
-            new Thread(new Uploader(new ArrayList<>(EMAILS))).start();
-        }
         double executionTime = (System.currentTimeMillis() - START_TIME) / 1000.0;
-        log(maxThreads, uploadThreshold, executionTime);
-        System.out.println("Completed crawl and upload.\nElapsed time: "
-                + executionTime + "s.");
+        System.out.println("Completed crawl.\nElapsed time: " + executionTime);
+        //When done crawling:
+        try {
+            dbConnection = DriverManager.getConnection(connectionString());
+            upload();
+            log(executionTime);
+            executionTime = (System.currentTimeMillis() - START_TIME) / 1000.0;
+            System.out.println("Completed upload.\nTotal elapsed time: "
+                    + executionTime + "s.");
+        } catch (SQLException e) {
+            System.out.println("Could not connect to database:");
+            e.printStackTrace();
+        } catch (IOException e) {
+            System.out.println("Could not retrieve database secrets:");
+            e.printStackTrace();
+        }
     }
 
-    private void log(int maxThreads, int uploadThreshold, double executionTime) {
-        try {
-            PreparedStatement logQuery = CONNECTION.prepareStatement("INSERT INTO Log VALUES(SYSDATETIME(), ?, ?, ?, ?)");
-            logQuery.setInt(1, MAX_EMAILS);
-            logQuery.setInt(2, maxThreads);
-            logQuery.setInt(3, uploadThreshold);
-            logQuery.setDouble(4, executionTime);
-            logQuery.execute();
-            logQuery.closeOnCompletion();
-        } catch (SQLException throwables) {
-            throwables.printStackTrace();
+    private void crawl(ExecutorService pool) {
+        String url;
+        while (EMAILS.size() < MAX_EMAILS) {
+            url = URLS.poll();
+            if (url != null) {
+                VISITED.add(url);
+                pool.execute(new ScraperWorker(url));
+            }
         }
     }
 
@@ -70,25 +77,35 @@ public class Scraper {
                 ";password=" + props.getProperty("password");
     }
 
-    private void crawl(ExecutorService pool, int uploadThreshold) {
-        int uploadCount = 0;
-        String url;
-        while (EMAILS.size() + uploadCount < MAX_EMAILS) {
-            url = URLS.poll();
-            if (url != null) {
-                VISITED.add(url);
-                pool.execute(new ScraperWorker(url));
+    private void upload() {
+        try {
+            PreparedStatement stmt = dbConnection.prepareStatement(
+                    "INSERT INTO Emails VALUES (?)"
+            );
+            for (String e : EMAILS) {
+                stmt.setString(1, e);
+                stmt.addBatch();
             }
-            if (EMAILS.size() > uploadThreshold) {
-                synchronized (EMAILS) {
-                    uploadCount += EMAILS.size();
-                    pool.execute(new Uploader(new ArrayList<>(EMAILS)));
-                    EMAILS.clear();
-                    System.out.println(uploadCount);
-                }
-            }
+            stmt.executeBatch();
+        } catch (SQLException e) {
+            System.out.println("Could not complete query:");
+            e.printStackTrace();
         }
-        System.out.println("Number of emails: " + (EMAILS.size() + uploadCount * uploadThreshold));
+    }
+
+    private void log(double executionTime) {
+        try {
+            PreparedStatement logQuery = dbConnection.prepareStatement(
+                    "INSERT INTO Log VALUES(SYSDATETIME(), ?, ?, ?, ?)"
+            );
+            logQuery.setInt(1, MAX_EMAILS);
+            logQuery.setInt(2, MAX_THREADS);
+            logQuery.setDouble(3, executionTime);
+            logQuery.setInt(4, VISITED.size());
+            logQuery.execute();
+        } catch (SQLException throwables) {
+            throwables.printStackTrace();
+        }
     }
 
     class ScraperWorker implements Runnable {
@@ -102,12 +119,6 @@ public class Scraper {
         public void run() {
             try {
                 Document doc = Jsoup.connect(URL).get();
-                //URLs:
-                doc.select("a[href]").eachAttr("abs:href").forEach(a -> {
-                    if (!VISITED.contains(a) && /*Exclude links that are not webpages*/ (a.contains("https://") || a.contains("http://"))) {
-                        URLS.add(a);
-                    }
-                });
                 //Emails:
                 Matcher emailMatcher = Pattern.compile("[A-Za-z][A-Za-z.\\-_%+]{0,63}@" +
                         "(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?\\.){1,8}" +
@@ -118,14 +129,24 @@ public class Scraper {
                         EMAILS.add(email);
                     }
                 }
+                //URLs:
+                if (URLS.size() < MAX_URLS) {
+                    doc.select("a[href]").eachAttr("abs:href").forEach(a -> {
+                        if (!VISITED.contains(a) && !URLS.contains(a) &&
+                                /* Exclude links that are not webpages: */
+                                (a.contains("https://") || a.contains("http://"))) {
+                            URLS.add(trimURL(a));
+                        }
+                    });
+                }
             } catch (Exception ignored) {}
         }
 
-        //Removes
         private String filterEmail(String email) {
-            String[] fileTypes = new String[] {"png", "jpg", "gif", "pdf", "mp3", "mp4", "mov", "7z", "zip", "mkv", "avi", "jpeg"};
+            final String[] FILE_TYPES = new String[] {"png", "jpg", "gif", "pdf", "mp3", "css",
+                    "mp4", "mov", "7z", "zip", "mkv", "avi", "jpeg"};
             String lc = email.substring(email.indexOf('@')).toLowerCase();
-            for (String t: fileTypes) {
+            for (String t: FILE_TYPES) {
                 if (lc.contains('.' + t)) {
                     email = null;
                     break;
@@ -133,29 +154,16 @@ public class Scraper {
             }
             return email;
         }
-    }
 
-    private class Uploader implements Runnable {
-        private final ArrayList<String> DATA;
-
-        public Uploader(ArrayList<String> strings) {
-            DATA = strings;
-        }
-
-        @Override
-        public void run() {
-            try {
-                PreparedStatement stmt = CONNECTION.prepareStatement("INSERT INTO Emails VALUES (?)");
-                for (String e : DATA) {
-                    stmt.setString(1, e);
-                    stmt.addBatch();
-                }
-                stmt.executeBatch();
-                stmt.closeOnCompletion();
-            } catch (SQLException e) {
-                System.out.println("Data upload failed:");
-                e.printStackTrace();
+        private String trimURL(String url) {
+            int i = url.indexOf('#');
+            if (i >= 12) {
+                url = url.substring(0, i);
             }
+            if (!url.contains("?") && url.charAt(url.length() - 1) != '/') {
+                url = url + '/';
+            }
+            return url;
         }
     }
 }
