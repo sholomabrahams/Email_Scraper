@@ -13,30 +13,35 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.Properties;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class Scraper {
     private final Set<String> EMAILS, VISITED;
-    private final LinkedBlockingQueue<String> URLS;
+    private final ThreadPoolExecutor POOL;
     private final int MAX_EMAILS, MAX_THREADS, MAX_URLS;
     private Connection dbConnection = null;
+    private boolean completed = false;
+    private final long START_TIME;
+    private int numCommitted = 0;
 
     public Scraper(int maxEmails, int maxThreads) {
-        long START_TIME = System.currentTimeMillis();
+        START_TIME = System.currentTimeMillis();
         MAX_EMAILS = maxEmails;
         MAX_THREADS = maxThreads;
         MAX_URLS = (int) (MAX_THREADS * 1.5);
-        ExecutorService pool = Executors.newFixedThreadPool(MAX_THREADS);
-        URLS = new LinkedBlockingQueue<>();
-        URLS.add("https://www.touro.edu/");
+        POOL = (ThreadPoolExecutor) Executors.newFixedThreadPool(MAX_THREADS);
         VISITED = Collections.synchronizedSet(new HashSet<>(MAX_EMAILS * 5));
         EMAILS = Collections.synchronizedSet(new HashSet<>(MAX_EMAILS));
-        crawl(pool);
-        pool.shutdownNow();
+        POOL.execute(new ScraperWorker("https://www.touro.edu/"));
+    }
+
+    private void finish() {
+        if (completed) return;
+        completed = true;
+        POOL.shutdownNow();
         double executionTime = (System.currentTimeMillis() - START_TIME) / 1000.0;
         System.out.println("Completed crawl.\nElapsed time: " + executionTime);
         //When done crawling:
@@ -46,24 +51,13 @@ public class Scraper {
             log(executionTime);
             executionTime = (System.currentTimeMillis() - START_TIME) / 1000.0;
             System.out.println("Completed upload.\nTotal elapsed time: "
-                    + executionTime + "s.");
+                    + executionTime + "s.\nURLs visited: " + VISITED.size());
         } catch (SQLException e) {
             System.out.println("Could not connect to database:");
             e.printStackTrace();
         } catch (IOException e) {
             System.out.println("Could not retrieve database secrets:");
             e.printStackTrace();
-        }
-    }
-
-    private void crawl(ExecutorService pool) {
-        String url;
-        while (EMAILS.size() < MAX_EMAILS) {
-            url = URLS.poll();
-            if (url != null) {
-                VISITED.add(url);
-                pool.execute(new ScraperWorker(url));
-            }
         }
     }
 
@@ -113,12 +107,29 @@ public class Scraper {
 
         ScraperWorker(String url) {
             URL = url;
+            VISITED.add(URL);
+            numCommitted++;
         }
 
         @Override
         public void run() {
+            if (EMAILS.size() >= MAX_EMAILS) {
+                finish();
+                return;
+            }
             try {
                 Document doc = Jsoup.connect(URL).get();
+                //URLs:
+                if (numCommitted <= MAX_URLS * 2) {
+                    doc.select("a[href]").eachAttr("abs:href").forEach(a -> {
+                        a = trimURL(a);
+                        if (!VISITED.contains(a) &&
+                                /* Exclude links that are not webpages: */
+                                (a.contains("https://") || a.contains("http://"))) {
+                            POOL.execute(new ScraperWorker(a));
+                        }
+                    });
+                }
                 //Emails:
                 Matcher emailMatcher = Pattern.compile("[A-Za-z][A-Za-z.\\-_%+]{0,63}@" +
                         "(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?\\.){1,8}" +
@@ -129,17 +140,9 @@ public class Scraper {
                         EMAILS.add(email);
                     }
                 }
-                //URLs:
-                if (URLS.size() < MAX_URLS) {
-                    doc.select("a[href]").eachAttr("abs:href").forEach(a -> {
-                        if (!VISITED.contains(a) && !URLS.contains(a) &&
-                                /* Exclude links that are not webpages: */
-                                (a.contains("https://") || a.contains("http://"))) {
-                            URLS.add(trimURL(a));
-                        }
-                    });
-                }
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {} finally {
+                numCommitted--;
+            }
         }
 
         private String filterEmail(String email) {
